@@ -1,0 +1,88 @@
+name: "Build & Sign APK (Auto Keystore, API 35)"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK + Build Tools
+        uses: android-actions/setup-android@v3
+
+      - name: Accept licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install SDK packages (API 35 + fallback 34)
+        run: |
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" || true
+
+      - name: Download Gradle 8.7
+        run: |
+          sudo apt-get update && sudo apt-get install -y unzip curl
+          curl -L --retry 3 --retry-delay 5 -o gradle-8.7-bin.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle-8.7-bin.zip
+          echo "$PWD/gradle-8.7/bin" >> $GITHUB_PATH
+          gradle --version
+
+      - name: Generate Gradle wrapper
+        run: gradle wrapper
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build Release (unsigned)
+        run: ./gradlew --no-daemon clean assembleRelease
+
+      - name: Create temp keystore (for testing install)
+        run: |
+          set -e
+          KEYSTORE=release-temp.jks
+          ALIAS=release
+          PASS=android
+          keytool -genkeypair -v -keystore "$KEYSTORE" -storepass "$PASS" -keypass "$PASS"                   -keyalg RSA -keysize 2048 -validity 3650 -alias "$ALIAS"                   -dname "CN=Lineman Webview, OU=Dev, O=Errortoken, L=Bangkok, ST=TH, C=TH"
+          echo "KEYSTORE=$KEYSTORE" >> $GITHUB_ENV
+          echo "ALIAS=$ALIAS" >> $GITHUB_ENV
+          echo "PASS=$PASS" >> $GITHUB_ENV
+
+      - name: Zipalign & Sign APK
+        run: |
+          set -e
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n1)
+          UNSIGNED=$(ls app/build/outputs/apk/release/*-unsigned.apk | head -n1)
+          echo "Using build-tools at: $BUILD_TOOLS"
+          echo "Unsigned APK: $UNSIGNED"
+          ALIGNED=app-release-aligned.apk
+          SIGNED=app-release-signed.apk
+          "$BUILD_TOOLS/zipalign" -p -f 4 "$UNSIGNED" "$ALIGNED"
+          "$BUILD_TOOLS/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:"$PASS" --key-pass pass:"$PASS" --out "$SIGNED" "$ALIGNED"
+          "$BUILD_TOOLS/apksigner" verify --print-certs "$SIGNED"
+          echo "SIGNED_APK=$SIGNED" >> $GITHUB_ENV
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineman-webview-apk-signed
+          path: ${{ env.SIGNED_APK }}
+
+      - name: Build Debug (already debug-signed)
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineman-webview-apk-debug
+          path: app/build/outputs/apk/debug/*-debug.apk
